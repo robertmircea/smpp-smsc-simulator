@@ -68,6 +68,7 @@ The SMSC can simmulate different replies depending on some conditions specified 
 * if dest.addr == 444 -> reply with submit_sm_resp with status ESME_RTHROTTLED
 * if dest.addr == 555 -> reply with submit_sm_resp with status ESME_RMSGQFUL
 * if dest.addr == 666 -> reply with submit_sm_resp with status ESME_ROK, but generate a delivery report with status UNDELIVERED
+* if dest.addr == 777 -> reply with submit_sm_resp with status ESME_ROK, but generate a delivery report with status EXPIRED
 * if dest.addr.len < 8 -> reply with submit_sm_resp with status ESME_INVDSTADR
 * if system_id is in destination address -> reply with submit_sm_resp with status ESME_ROK, but also generate a deliver_sm mobile originated message
 
