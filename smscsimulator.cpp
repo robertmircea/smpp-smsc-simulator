@@ -14,22 +14,21 @@
 
 #include <iostream>
 #include <string>
-#include <exception>
 #include <map>
 #include <list>
 
 using namespace std;
 
 #include <unistd.h>
-
 #include <sys/ioctl.h>
 #include <time.h>
 #include <sys/time.h>
+#include<vector>
 
-#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <thread>
 
 #define TRUE  (1==1)
 #define FALSE (!TRUE)
@@ -46,6 +45,14 @@ uint64_t currentUSecsSinceEpoch( void )
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec;
 }
+
+void printTimeT(time_t t){
+    std::tm * ptm = std::gmtime(&t);
+    char buffer[80];
+    std::strftime(buffer, 80, "%d.%m.%y %H:%M:%S", ptm);
+    printf("time=%s\n", buffer);
+}
+
 
 // Client config
 
@@ -98,6 +105,7 @@ public:
         uint8_t short_message[160];
         
         string smscMessageID;
+        uint8_t smppMessageState;
         
     private:
         string content;
@@ -114,11 +122,12 @@ public:
         void setRegisteredDelivery( uint8_t val ) { registered_delivery = val; }
         void setShortMessage( uint8_t* sm_in, uint8_t sm_len_in ) { memcpy(short_message, sm_in, sm_len_in); sm_length = sm_len_in; }
         void setSMSCMessageID( char* id ) { smscMessageID = id; }
+        void setSmppMessageState(uint8_t messageState ) { smppMessageState = messageState; }
     };
     
 private:
     // time-ordered list [using STL map] of lists containing messages
-    typedef map<uint64_t/*time*/,list<Message>> MessageQueue;
+    typedef map<uint64_t/*time*/,list<Message> > MessageQueue;
     MessageQueue mq;
     
     MessageDeliverer() {}
@@ -249,15 +258,32 @@ public:
 
 class SMPP {
 public:
+
+    class SmppMessageState {
+        public:
+            static const uint8_t SCHEDULED = 0;
+            static const uint8_t ENROUTE = 1;
+            static const uint8_t DELIVRD = 2;
+            static const uint8_t EXPIRED = 3;
+            static const uint8_t DELETED = 4;
+            static const uint8_t UNDELIV = 5;
+            static const uint8_t ACCEPTD = 6;
+            static const uint8_t UNKNOWN = 7;
+            static const uint8_t REJECTD = 8;
+            static const uint8_t SKIPPED = 9;
+    };
     
     class CmdStatus {
     public:
         static const uint64_t ESME_ROK = 0x00000000;
         static const uint64_t ESME_RINVBNDSTS = 0x00000004;
         static const uint64_t ESME_INVDSTADR = 0x0000000B;
+        static const uint64_t ESME_RTHROTTLED = 0x00000058;
         static const uint64_t ESME_RBINDFAIL = 0x0000000D;
         static const uint64_t ESME_RSUBMITFAIL = 0x00000045;
         static const uint64_t ESME_RINVSCHED = 0x00000061;
+        static const uint64_t ESME_RX_R_APPN = 0x00000066;
+        static const uint64_t ESME_RMSGQFUL = 0x00000014;
     };
     
     class CmdID {
@@ -343,8 +369,28 @@ public:
         }
         return "";
     }
-    
-    static void GSMTimeStringShort( time_t& t, char* szTimestamp, int nLen )
+
+    const char *cmdStatusToString(uint64_t cmdStatus){
+        switch (cmdStatus)
+        {
+            case CmdStatus::ESME_ROK:
+                return "ESME_ROK";
+            case CmdStatus::ESME_RTHROTTLED:
+                return "ESME_RTHROTTLED";
+            case CmdStatus::ESME_RSUBMITFAIL:
+                return "ESME_RSUBMITFAIL";
+            case CmdStatus::ESME_RINVSCHED:
+                return "ESME_RINVSCHED";
+            case CmdStatus::ESME_INVDSTADR:
+                return "ESME_INVDSTADR";
+            case CmdStatus::ESME_RX_R_APPN:
+                return "ESME_RX_R_APPN";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    static void GSMTimeStringShort(time_t &t, char *szTimestamp, int nLen)
     {
         if ( t < 0 ) return;
 
@@ -584,6 +630,7 @@ public:
     }
     
     uint64_t pduCommandID( void ) { return command_received_header.command_id; }
+    uint64_t pduCommandStatus( void ) { return command_received_header.command_status; }
     uint64_t pduSequenceNo( void ) { return command_received_header.sequence_number; }
 };
 
@@ -637,6 +684,8 @@ private:
     uint64_t lastPDUFromESMETime = 0;
     uint64_t enquireLinkRespPending = 0;
     uint64_t closingTime = 0;
+    bool showEnquireLinks;
+    bool doNotPrintCommands;
     
 public:
     typedef enum { BS_NONE, BS_TRX, BS_TX, BS_RX } BindState;
@@ -655,7 +704,7 @@ public:
         session_id = session_id_next++;
     }
     
-    SMPPSession(int fdsocket,char* ip)
+    SMPPSession(int fdsocket,char* ip, bool showEnquireLinks, bool doNotPrintCommands)
     {
         bindState = BS_NONE;
         version = 0x00;
@@ -663,6 +712,8 @@ public:
         conn.setIP(ip);
         
         session_id = session_id_next++;
+        this->showEnquireLinks = showEnquireLinks;
+        this->doNotPrintCommands = doNotPrintCommands;
     }
     
     ~SMPPSession() {
@@ -745,11 +796,12 @@ public:
                     uint8_t dest_addr_ton = msg.dest_addr_ton, dest_addr_npi = msg.dest_addr_npi;
                     string source_addr = msg.source_addr;
                     string msgid = msg.smscMessageID;
+                    uint8_t smpp_message_state = msg.smppMessageState;
                     
-                    generateReceipt(source_addr_ton,source_addr_npi,source_addr,dest_addr_ton,dest_addr_npi,destination_addr,msgid);
+                    generateReceipt(source_addr_ton,source_addr_npi,source_addr,dest_addr_ton,dest_addr_npi,destination_addr,msgid, smpp_message_state);
                 }
                 
-                if ( strstr(msg.destination_addr,system_id.c_str()) != NULL ) { // system_id is in destination address - assume MO for testing purposes
+                if ( strstr(msg.destination_addr,system_id.c_str()) != nullptr ||  strstr(msg.destination_addr, "55555555" ) != nullptr) { // system_id is in destination address - assume MO for testing purposes
                     generateMO(msg.source_addr_ton,msg.source_addr_npi,msg.source_addr,
                                msg.dest_addr_ton,msg.dest_addr_npi,msg.destination_addr,
                                msg.short_message,msg.sm_length);
@@ -801,7 +853,7 @@ public:
     
     void generateReceipt(uint8_t source_addr_ton,uint8_t source_addr_npi,string source_addr,
                          uint8_t dest_addr_ton,uint8_t dest_addr_npi,string destination_addr,
-                         string msgid)
+                         string msgid, uint8_t smpp_message_state)
     {
         // receipt
         
@@ -860,7 +912,7 @@ public:
                     // message_state TLV
                     0x04, 0x27, // tag
                     0x00, 0x01, // length
-                    0x02, // value - delivered
+                    smpp_message_state, // value - delivered
                     
                     // network_error TLV
                     0x04, 0x23, // tag
@@ -1007,8 +1059,10 @@ public:
                     uint64_t tESMEDeliveryTimeRequired = tNow; // default to immediate delivery
                     
                     bool allowSubmit = true;
+                    bool sendReply = true;
                     uint64_t smppSubmitError = SMPP::CmdStatus::ESME_RSUBMITFAIL;
-                    
+                    uint8_t smppMessageState = SMPP::SmppMessageState::DELIVRD;
+
                     string service_type = "";
                     uint8_t source_addr_ton = 0;
                     uint8_t source_addr_npi = 0;
@@ -1061,44 +1115,83 @@ public:
                             goto parse_complete_submit;
                         }
                     }
-                    
-                    // ...
-                    
+
+                    if (destination_addr == "111") {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+                        goto parse_complete_submit;
+                    } // introduce deliberate 10s delay before replying
+                    if (destination_addr == "222") { allowSubmit = false; sendReply = false; goto parse_complete_submit; } // force no answer to test special conditions
                     if (destination_addr == "333") { allowSubmit = false; goto parse_complete_submit; } // force ESME_RSUBMITFAIL
-                    
+                    if (destination_addr == "444")
+                    {
+                        allowSubmit = false;
+                        smppSubmitError = SMPP::CmdStatus::ESME_RTHROTTLED;
+                        goto parse_complete_submit;
+                    }
+                    if (destination_addr == "555")
+                    {
+                        allowSubmit = false;
+                        smppSubmitError = SMPP::CmdStatus::ESME_RMSGQFUL;
+                        goto parse_complete_submit;
+                    }
+
+                    if (destination_addr == "666")
+                    {
+                        smppMessageState = SMPP::SmppMessageState::UNDELIV;
+                        goto parse_complete_submit;
+                    }
+                    if (destination_addr == "777")
+                    {
+                        smppMessageState = SMPP::SmppMessageState::EXPIRED;
+                        // if (validity_period.length()>0){
+                        //     if (validity_period[validity_period.length()-1] == 'R') //relative time
+                        //         tESMEDeliveryTimeRequired = tNow + SMPP::GSMRelativeTime((char*)validity_period.c_str())*1000000L;
+                        //     else
+                        //         tESMEDeliveryTimeRequired = (SMPP::GSMStringTime(validity_period.c_str()))*1000000L;
+
+                        // } else {
+                        //     //no validity period specified, we don't care
+                        // }
+                        goto parse_complete_submit;
+                    }
+
                     if (destination_addr.length()<8) { allowSubmit = false; smppSubmitError = SMPP::CmdStatus::ESME_INVDSTADR; goto parse_complete_submit; }
                     
                     parse_complete_submit:
                     
-                    // send response
-                    
-                    if (allowSubmit)
-                    {
-                        // accept message and send message ID back to ESME
-                        
-                        int msgid_len = 64; // PROTOCOL v3.4 message_id field is COctet String of up to 65 chars (inc NULL terminator)
-                        if ( version < 0x34 ) msgid_len = 8; // PROTOCOL v3.3 message_id field is COctet String (hex) of up to 9 characters (inc NULL terminator)
-                        
-                        char msgid[msgid_len+1];
-                        for(int i=0;i<msgid_len;i++) msgid[i] = (rand()%16)<10?('0'+rand()%10):('a'+rand()%6);
-                        msgid[msgid_len] = 0;
-                        send(seqno,SMPP::CmdID::SubmitSMResp,SMPP::CmdStatus::ESME_ROK,(uint8_t*)msgid,msgid_len+1);
-                        
-                        // add message to deliverer so that receipt will then be sent to ESME
-                        
-                        uint64_t timeDeliver = tESMEDeliveryTimeRequired + (3+(rand()%10))*1000000L;
-                        
+                    if (sendReply) {
 
-                        
-                        MessageDeliverer::Message msg;
-                        msg.setSource(source_addr_ton,source_addr_npi,(char*)source_addr.c_str());
-                        msg.setDestination(dest_addr_ton,dest_addr_npi,(char*)destination_addr.c_str());
-                        msg.setRegisteredDelivery(registered_delivery);
-                        msg.setShortMessage(short_message, sm_length);
-                        msg.setSMSCMessageID(msgid);
-                        MessageDeliverer::getInstance(system_id)->add(timeDeliver,msg);
+                        // send response
+                        if (allowSubmit) {
+                            // accept message and send message ID back to ESME
+
+                            int msgid_len = 64; // PROTOCOL v3.4 message_id field is COctet String of up to 65 chars (inc NULL terminator)
+                            if (version < 0x34)
+                                msgid_len = 8; // PROTOCOL v3.3 message_id field is COctet String (hex) of up to 9 characters (inc NULL terminator)
+
+                            char msgid[msgid_len + 1];
+                            for (int i = 0; i < msgid_len; i++)
+                                msgid[i] = (rand() % 16) < 10 ? ('0' + rand() % 10) : ('a' + rand() % 6);
+                            msgid[msgid_len] = 0;
+                            send(seqno, SMPP::CmdID::SubmitSMResp, SMPP::CmdStatus::ESME_ROK, (uint8_t *) msgid,
+                                 msgid_len + 1);
+
+                            // add message to deliverer so that receipt will then be sent to ESME
+
+                            uint64_t timeDeliver = tESMEDeliveryTimeRequired + (3 + (rand() % 10)) * 1000000L;
+
+
+                            MessageDeliverer::Message msg;
+                            msg.setSource(source_addr_ton, source_addr_npi, (char *) source_addr.c_str());
+                            msg.setDestination(dest_addr_ton, dest_addr_npi, (char *) destination_addr.c_str());
+                            msg.setRegisteredDelivery(registered_delivery);
+                            msg.setShortMessage(short_message, sm_length);
+                            msg.setSMSCMessageID(msgid);
+                            msg.setSmppMessageState(smppMessageState);
+                            MessageDeliverer::getInstance(system_id)->add(timeDeliver, msg);
+                        } else
+                            send(seqno, SMPP::CmdID::SubmitSMResp, smppSubmitError, NULL,0); // don't accept message and send NAK back to ESME
                     }
-                    else send(seqno,SMPP::CmdID::SubmitSMResp, smppSubmitError, NULL, 0); // don't accept message and send NAK back to ESME
                 }
             }
         }
@@ -1111,12 +1204,16 @@ public:
     
     uint8_t getVersion(void) { return version; }
     void setVersion(uint8_t version_in) { version = version_in; }
-    
-    void logCommand(uint64_t cmdID,const char* direction)
+
+    void logCommand(uint64_t cmdID, uint64_t seqNo, uint64_t cmdStatus, const char *direction)
     {
+        if (doNotPrintCommands) return;
+
+        if ((cmdID == SMPP::CmdID::EnquireLink || cmdID == SMPP::CmdID::EnquireLinkResp) && !showEnquireLinks) return;
+
         char buf[640];
         SMPP b;
-        sprintf(buf,"0x%08llx %s",cmdID,b.cmdString(cmdID));
+        sprintf(buf, "[0x%08llx %-20s] [seq#: %8llu] [st: 0x%08llx - %-20s]", cmdID, b.cmdString(cmdID), seqNo, cmdStatus, b.cmdStatusToString(cmdStatus));
         logCommand(buf,direction);
     }
 
@@ -1133,12 +1230,16 @@ public:
         
         printf("%s %s [s%06llx:%-15s] %s\n",buffer,direction,session_id,conn.getIP(),logline);
     }
-    
+
+
     bool recv( uint64_t& cmdID, uint64_t& seqNo )
     {
         bool ret = conn.get();
-        if (ret) { cmdID = conn.pduCommandID(); seqNo  = conn.pduSequenceNo();
-            logCommand(cmdID,">>");
+        if (ret) { 
+            cmdID = conn.pduCommandID(); 
+            seqNo  = conn.pduSequenceNo();
+            uint64_t cmdStatus = conn.pduCommandStatus();
+            logCommand(cmdID, seqNo, cmdStatus, ">>");
         }
         return ret;
     }
@@ -1147,7 +1248,7 @@ public:
     {
         //SMPP b;
         //printf("<< 0x%08llx %s\n",cmdID,b.cmdString(cmdID));
-        logCommand(cmdID,"<<");
+        logCommand(cmdID, seqNo, cmdStatus, "<<");
         
         return conn.put(seqNo, cmdID, cmdStatus, param, len);
     }
@@ -1219,14 +1320,76 @@ int dolisten( int portno )
 
 Session* sessionSockMap[32000]; // array of SMPP session by socket
 
-int main(int argc, const char * argv[])
+
+class InputParser{
+public:
+    InputParser (int &argc, const char **argv){
+        for (int i=1; i < argc; ++i)
+            this->tokens.emplace_back(argv[i]);
+    }
+    [[nodiscard]] const std::string& getCmdOption(const std::string &option) const{
+        std::vector<std::string>::const_iterator itr;
+        itr =  std::find(this->tokens.begin(), this->tokens.end(), option);
+        if (itr != this->tokens.end() && ++itr != this->tokens.end()){
+            return *itr;
+        }
+        static const std::string empty_string("");
+        return empty_string;
+    }
+    bool cmdOptionExists(const std::string &option) const{
+        return std::find(this->tokens.begin(), this->tokens.end(), option)
+               != this->tokens.end();
+    }
+private:
+    std::vector <std::string> tokens;
+};
+
+
+int main(int argc, const char *argv[])
 {
     printf("%s build time: %s %s\n",argv[0],__DATE__,__TIME__);
-    
-    //
-    
+
+    bool showEnquireLinks = false;
+    bool quiet = false;
+
+    InputParser input(argc, argv);
+    if(input.cmdOptionExists("--help")){
+        printf("SMPP Smsc Simulator\n");
+        printf("\t--help\t\tPrint this help and exit.\n");
+        printf("\t--enquireLinks\tPrint enquire link and enquire link responses on console.\n");
+        printf("\t--quiet\t\tDo not print smpp commands on console.\n");
+        printf("\t--port\t\tSmpp port to listen to. Default if not specified 2775.\n");
+        printf("\n\nUseful hints:\n");
+        printf("\t- if ESME submits dest.addr == 111, then simulator introduces a 10 seconds delay before sending a reply for submit_sm\n");
+        printf("\t- if ESME submits dest.addr == 222, then simulator does not send a reply for submit_sm\n");
+        printf("\t- if ESME submits dest.addr == 333, then simulator replies with ESME_RSUBMITFAIL\n");
+        printf("\t- if ESME submits dest.addr == 444, then simulator replies with ESME_RTHROTTLED\n");
+        printf("\t- if ESME submits dest.addr == 555, then simulator replies with ESME_RMSGQFUL\n");
+        printf("\t- if ESME submits dest.addr == 666, then simulator replies with ESME_ROK, but generates a delivery report with status undelivered\n");
+        printf("\t- if ESME submits dest.addr.len < 8, then simulator replies with ESME_INVDSTADR\n");
+        printf("\t- if ESME submits system id in dest.addr, then simulator replies with a MO deliver_sm\n");
+        exit(0);
+    }
+
+    if(input.cmdOptionExists("--enquireLinks")){
+        showEnquireLinks = true;
+    }
+
+    if(input.cmdOptionExists("--quiet")){
+        quiet = true;
+    }
+
     int portSMPP = 2775;
-    
+    if(input.cmdOptionExists("--port")) {
+        const std::string &port = input.getCmdOption("--port");
+        portSMPP = stoi(port);
+        if (portSMPP < 1 || portSMPP > 65535) {
+            perror("Invalid listening port number");
+            exit(1);
+        }
+    }
+
+
     int listensockfdSMPP = dolisten(portSMPP);
     
     if (listensockfdSMPP==-1) {
@@ -1385,7 +1548,7 @@ int main(int argc, const char * argv[])
                         
                         //
                         
-                        SMPPSession* newsession = new SMPPSession(new_sd,ip);
+                        SMPPSession* newsession = new SMPPSession(new_sd,ip, showEnquireLinks, quiet);
                         
                         sessionSockMap[new_sd] = newsession;
                         
