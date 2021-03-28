@@ -41,6 +41,7 @@ Useful hints:
 	- if ESME submits dest.addr == 444, then simulator replies with ESME_RTHROTTLED
 	- if ESME submits dest.addr == 555, then simulator replies with ESME_RMSGQFUL
 	- if ESME submits dest.addr == 666, then simulator replies with ESME_ROK, but generates a delivery report with status undelivered
+	- if ESME submits dest.addr == 777, then simulator replies with ESME_ROK, but generates a delivery report with status expired
 	- if ESME submits dest.addr.len < 8, then simulator replies with ESME_INVDSTADR
 	- if ESME submits system id in dest.addr, then simulator replies with a MO deliver_sm
 ```

@@ -1322,6 +1322,9 @@ Session* sessionSockMap[32000]; // array of SMPP session by socket
 
 
 class InputParser{
+private:
+    std::vector <std::string> tokens;
+
 public:
     InputParser (int &argc, const char **argv){
         for (int i=1; i < argc; ++i)
@@ -1340,8 +1343,6 @@ public:
         return std::find(this->tokens.begin(), this->tokens.end(), option)
                != this->tokens.end();
     }
-private:
-    std::vector <std::string> tokens;
 };
 
 
@@ -1366,6 +1367,7 @@ int main(int argc, const char *argv[])
         printf("\t- if ESME submits dest.addr == 444, then simulator replies with ESME_RTHROTTLED\n");
         printf("\t- if ESME submits dest.addr == 555, then simulator replies with ESME_RMSGQFUL\n");
         printf("\t- if ESME submits dest.addr == 666, then simulator replies with ESME_ROK, but generates a delivery report with status undelivered\n");
+        printf("\t- if ESME submits dest.addr == 777, then simulator replies with ESME_ROK, but generates a delivery report with status expired\n");
         printf("\t- if ESME submits dest.addr.len < 8, then simulator replies with ESME_INVDSTADR\n");
         printf("\t- if ESME submits system id in dest.addr, then simulator replies with a MO deliver_sm\n");
         exit(0);
